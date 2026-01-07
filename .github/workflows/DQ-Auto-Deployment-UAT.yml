@@ -1,0 +1,198 @@
+name: DQ-Auto-Deployment-UAT
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: 'Select Environment'
+        options:
+          - UAT
+        default: UAT
+        required: true
+      ubifJob:
+        type: boolean
+        description: 'UBIF Job'
+        default: False
+        required: true
+      validationID:
+        description: 'Validation ID'
+        default: ''
+        required: true  
+      jobName:
+        description: 'Job Name'
+        default: ''
+        required: false
+      folder_name:
+        description: 'Top folder name'
+        default: ''
+        required: true
+      branch_name:
+        description: 'Branch Name'
+        default: ''
+        required: true
+      commit_message:
+        description: 'Commit Message'
+        default: ''
+        required: true
+
+jobs:
+  Deploy:
+    runs-on: [eds-8gb] #self-hosted,eds-general
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      SNOW_USR: ${{ secrets.SNOW_USR }}
+      SNOW_PSW: ${{ secrets.SNOW_PSW }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 2
+
+      - name: dev/ branch exists or not
+        run: |
+          branch_name="dev/${{ github.event.inputs.branch_name }}"
+          if git ls-remote --heads origin "$branch_name" | grep -q "$branch_name"; then
+            echo "Branch $branch_name exists."
+          else
+            echo "Branch $branch_name does not exist."
+          fi
+
+      - name: Install rsync
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.8.12'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+            aws-region: us-east-1
+            role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_UAT }}
+            role-duration-seconds: 1200
+            role-skip-session-tagging: true
+
+      - name: Print AWS Account ID  #remove after the testing
+        run: |
+          aws_account_id=$(aws sts get-caller-identity --query Account --output text)
+          echo "AWS Account ID: $aws_account_id"   
+
+      - name: Run Python
+        run: |
+          pip install --upgrade pip
+          pip install boto3
+          pip install pymysql
+          git config user.name "$(git log -n 1 --pretty=format:%an)"
+          git config user.email "$(git log -n 1 --pretty=format:%ae)"
+          git fetch
+          git checkout EDS-95048_bhushan_UAT_CICD   #git checkout main/master
+          git branch -r | grep -w "${{ github.event.inputs.environment == 'Development' && 'dev' || 'UAT' }}/${{ github.event.inputs.branch_name }}" &>/dev/null && git checkout "${{ github.event.inputs.environment == 'Development' && 'dev' || 'UAT' }}/${{ github.event.inputs.branch_name }}" || git checkout -b "${{ github.event.inputs.environment == 'Development' && 'dev' || 'UAT' }}/${{ github.event.inputs.branch_name }}"
+          python -X faulthandler ./pipeline/DataQuality_CICD/dataQuality.py -e "${{ github.event.inputs.environment }}" -v "${{ github.event.inputs.validationID }}" -j "${{ github.event.inputs.jobName }}" -u "${{ github.event.inputs.ubifJob }}" -i "hasSQL"
+
+      - name: Check If UBIF Job
+        if: ${{ github.event.inputs.ubifJob == 'true'}}
+        run: |  
+          echo "repo=DQJobs_UBIF" >>${GITHUB_ENV}
+          rsync -a cicd_dqsource/* "DQSource_UBIF"
+          git add "DQSource_UBIF"/*
+
+      - name: Else Regular Job
+        if: ${{ github.event.inputs.ubifJob == 'false'}}
+        run: | 
+          rsync -a cicd_dqsource/* "DQSource"
+          git add "DQSource"/*
+          folder_name_lowercase=$(echo "${{ github.event.inputs.folder_name }}" | tr '[:upper:]' '[:lower:]')
+          echo "Input folder name: $folder_name_lowercase"
+          echo "repo=${{ github.event.inputs.folder_name }}" >> $GITHUB_ENV
+          folders=$(ls -d */ | tr -d '/')
+          for folder in $folders; do
+            echo "actual folder $folder"
+            actual_folder_name=$(echo $folder | tr '[:upper:]' '[:lower:]')
+            if [ $actual_folder_name == $folder_name_lowercase ]; then
+                echo "repo=\"$folder\"" >> $GITHUB_ENV
+                echo "The folder exists. Actual folder name $folder"
+                exit 0
+            fi
+          done
+
+      - name: Create Branch and Push
+        run: |
+          mkdir -p "${{ env.repo }}"
+          rsync -a cicd/* "${{ env.repo }}"
+          ls "${{ env.repo }}"
+          git add "${{ env.repo }}"/*            
+          git status
+          git commit -m "${{ github.event.inputs.commit_message }}"
+          git push -u origin HEAD
+
+      - name: Find changes in codebase
+        id: changes
+        run: |
+          echo "This PR is merged by ${{ github.actor }} ."
+          echo "This PR is merged with commit: ${{ github.sha}} ."
+          github_name_status=$(git diff --name-status --diff-filter=AMR HEAD~1)
+          echo "Changes: $github_name_status"
+          github_changes=$(git diff --name-only --diff-filter=AMR HEAD~1)
+          echo "file_path=$(echo $github_changes)" >> $GITHUB_ENV
+          
+          #github_changes=$(git diff --name-only --diff-filter=AMR HEAD~1)
+          #file_path=$(echo "${{ github.event.inputs.file_path }}")
+          #echo "file_path=$(echo $file_path)" >> $GITHUB_ENV
+
+      - name: Create Array
+        id: create-array
+        run: |
+          datamartArray=()
+              jobArray=()
+              fileArray=()
+              for i in ${{ env.file_path }};
+              do
+                datamart=$(echo $i | cut -d/ -f1)
+                datamartArray+=( $datamart )
+                echo "$datamart"
+                job=$(echo $i | cut -d/ -f2)
+                jobArray+=( $job )
+                echo "$job"
+                file=$(echo $i | cut -d/ -f3)
+                fileArray+=( $file )
+                echo "$file"
+              done
+              datamartArray_string="${datamartArray[*]}"
+              datamart_array=$(echo "${datamartArray_string//${IFS:0:1}/,}")
+              jobArray_string="${jobArray[*]}"
+              job_array=$(echo "${jobArray_string//${IFS:0:1}/,}")
+              fileArray_string="${fileArray[*]}"
+              file_array=$(echo "${fileArray_string//${IFS:0:1}/,}")
+              echo "::set-output name=datamart_array::$datamart_array"
+              echo "::set-output name=job_array::$job_array"
+              echo "::set-output name=file_array::$file_array"
+
+      - name: Get results
+        run: |
+          echo "${{steps.create-array.outputs.datamart_array}}"
+          echo "${{steps.create-array.outputs.job_array}}"
+          echo "${{steps.create-array.outputs.file_array}}"
+
+      - name: Run Python /pipeline/bin/dataQuality_cicd.py
+        id: run-python
+        run: |
+          pip install pymysql
+          pip install boto3          
+          set +e
+          ls $RUNNER_PATH
+          python -X faulthandler ./pipeline/bin/dataQuality_cicd.py -m ${{steps.create-array.outputs.datamart_array}} -j ${{steps.create-array.outputs.job_array}} -p ${{steps.create-array.outputs.file_array}}
+          echo ::set-output name=exit_status::$?
+
+      - name: Deployment Success
+        if: steps.run-python.outputs.exit_status == 0
+        run: |
+          echo "Deployment Successful"
+
+      - name: Deployment Failure
+        if: steps.run-python.outputs.exit_status != 0
+        run: |
+          echo "Deployment Failed"
